@@ -101,30 +101,54 @@ label{display:block;margin:12px 0 5px;color:var(--mute);font-size:13px;font-weig
 <body>
 <div class="wrap" id="app"></div>
 <noscript>Die Hütte braucht JavaScript.</noscript>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script>
 /* ============ DATEN & SYNC ============
-Datenmodell (alles unter "huette/" in der Datenbank, jede Änderung = ein Pfad-Update):
+Datenmodell (je Pfad eine Zeile in huette_kv, jede Änderung = ein Pfad-Update):
  cats:   ["Nur chillen", …]
  racks:  { Getränkelager: 1, Alkohol: 1, Snackbar: 1 }           Anzahl Kästen/Schalen
  items:  { <id>: {tab, rack, slot, n, st:"voll"|"leer", by} }      eine Flasche/ein Snack pro Fach
  events: { "YYYY-MM-DD": {time, cat, rsvp:{Name:{s:"ja"|"nein", t}}, wishes:{<id>:{t, by, v:{Name:1}}}} }
  checks: { <itemId oder "w"+wishId>: true }                        Einkaufsliste abgehakt
-Firebase anbinden: DB = Realtime-Database-URL eintragen. Supabase: nur Store (load/save) austauschen. */
-const DB="";
+Backend: Supabase (Tabelle huette_kv, Realtime). Anderes Backend: nur Store (load/save) austauschen. */
+const SUPABASE_URL="https://nqaodmvnrpzydioaakdf.supabase.co"; // ohne /rest/v1/
+const SUPABASE_KEY="sb_publishable_KNjy27-8gRQTbCt-JdRpSA_EhJ_MAgQ"; // öffentlicher (publishable) Schlüssel, darf im Browser stehen
+const sb=window.supabase?window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY):null;
+const T="huette_kv"; // Tabelle: path (Text, Schlüssel) | value (jsonb) | updated_at
+let S={cats:["Nur chillen","Serien/Animes schauen","Spieleabend","Saufen und Rauchen"],racks:{},items:{},events:{},checks:{}};
+let offline=false;
+function setIn(path,val,root=S){const p=path.split("/");let o=root;for(let i=0;i<p.length-1;i++){o=o[p[i]]=o[p[i]]||{}}const k=p.at(-1);if(val===null)delete o[k];else o[k]=val}
+const cacheSave=()=>{try{localStorage.setItem("huette_cache",JSON.stringify(S))}catch(e){}};
+try{const c=JSON.parse(localStorage.getItem("huette_cache")||"null");if(c)Object.assign(S,c)}catch(e){}
 const Store={
-  url:DB.replace(/\/$/,""),
-  async load(){return this.url?await (await fetch(this.url+"/huette.json")).json():JSON.parse(localStorage.getItem("huette")||"null")},
-  async save(path,val){
-    if(this.url)await fetch(this.url+"/huette/"+path+".json",{method:val===null?"DELETE":"PUT",body:JSON.stringify(val)});
-    else localStorage.setItem("huette",JSON.stringify(S));
+  async load(){ // alle Zeilen holen und zu einem Objekt zusammensetzen (flache Pfade zuerst)
+    const{data,error}=await sb.from(T).select("path,value");if(error)throw error;
+    const d={};data.sort((x,y)=>x.path.split("/").length-y.path.split("/").length).forEach(r=>setIn(r.path,r.value,d));return d;
+  },
+  async save(path,val){ // Pfad samt Unterpfaden ersetzen
+    let r=await sb.from(T).delete().eq("path",path);if(r.error)throw r.error;
+    r=await sb.from(T).delete().like("path",path+"/*");if(r.error)throw r.error;
+    if(val!==null){r=await sb.from(T).upsert({path,value:val,updated_at:new Date().toISOString()});if(r.error)throw r.error}
   }
 };
-let S={cats:["Nur chillen","Serien/Animes schauen","Spieleabend","Saufen und Rauchen"],racks:{},items:{},events:{},checks:{}};
-function setIn(path,val){const p=path.split("/");let o=S;for(let i=0;i<p.length-1;i++){o=o[p[i]]=o[p[i]]||{}}const k=p.at(-1);if(val===null)delete o[k];else o[k]=val}
-async function put(path,val,quiet){setIn(path,val);try{await Store.save(path,val)}catch(e){}if(!quiet)render()}
+async function put(path,val,quiet){
+  setIn(path,val);cacheSave();if(!quiet)render();
+  if(!sb){offline=true;return}
+  try{await Store.save(path,val);offline=false}catch(e){offline=true;render()}
+}
 async function load(){
-  try{const d=await Store.load();if(d){S.cats=d.cats?Object.values(d.cats):S.cats;S.racks=d.racks||{};S.items=d.items||{};S.events=d.events||{};S.checks=d.checks||{}}}catch(e){}
+  if(!sb){offline=true;return}
+  try{
+    const d=await Store.load();
+    S.cats=d.cats?Object.values(d.cats):S.cats;S.racks=d.racks||{};S.items=d.items||{};S.events=d.events||{};S.checks=d.checks||{};
+    offline=false;cacheSave();
+  }catch(e){offline=true}
   if(!sh&&!/INPUT|SELECT/.test(document.activeElement.tagName))render();
+}
+function live(){ // Echtzeit: bei jeder Änderung in der Tabelle neu laden
+  if(!sb)return;let t;
+  sb.channel("huette").on("postgres_changes",{event:"*",schema:"public",table:T},()=>{clearTimeout(t);t=setTimeout(load,200)}).subscribe();
+  document.addEventListener("visibilitychange",()=>{if(!document.hidden)load()});
 }
 /* ============ UI-ZUSTAND ============ */
 const NAMES=["Duncan","Justin","Gores","Tyler","Simon"];
@@ -156,7 +180,7 @@ function render(){
   if(!me){$.innerHTML=`<header>${LOGO}<h1>Die Hütte</h1></header><p>Wer bist du?</p><div class="who">${NAMES.map(n=>`<button data-a="who" data-v="${n}">${ICON[n]} ${n}</button>`).join("")}</div>`;return}
   let h=`<header>${LOGO}<h1>Die Hütte</h1><button class="me" data-a="switch">${ICON[me]} ${me}</button></header>`;
   h+=view==="Kalender"?cal():inv();
-  if(!Store.url)h+=`<p class="hint">Testmodus: Daten liegen nur auf diesem Handy.</p>`;
+  if(offline)h+=`<p class="hint">Keine Verbindung – Änderungen werden evtl. nicht gespeichert.</p>`;
   h+=`<nav>${["Kalender",...TABS].map(t=>`<button data-a="view" data-v="${t}" class="${view===t?"on":""}">${NAV[t][1]}<span>${NAV[t][0]}</span></button>`).join("")}</nav>`;
   $.innerHTML=h+sheet();
 }
@@ -251,7 +275,7 @@ document.addEventListener("touchend",e=>{
   const dx=e.changedTouches[0].clientX-sx;if(Math.abs(dx)<70)return;
   const n=S.racks[view]||1;cur[view]=Math.max(0,Math.min(n-1,(cur[view]||0)+(dx<0?1:-1)));render();
 });
-render();load();setInterval(load,8000);
+render();load();live();setInterval(load,30000);
 if("serviceWorker" in navigator&&location.protocol.startsWith("http"))navigator.serviceWorker.register("sw.js").catch(()=>{});
 </script>
 </body>
